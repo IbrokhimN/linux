@@ -88,6 +88,7 @@
  * (Note: it'd be easy to port over the complete mkdep state machine,
  *  but I don't think the added complexity is worth it)
  */
+#define _POSIX_C_SOURCE 200809L
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -98,8 +99,17 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 
-#include <xalloc.h>
+static void *xmalloc(size_t size)
+{
+	void *p = malloc(size);
+	if (!p) {
+		fprintf(stderr, "fixdep: out of memory allocating %zu bytes\n", size);
+		exit(2);
+	}
+	return p;
+}
 
 static void usage(void)
 {
@@ -111,33 +121,38 @@ struct item {
 	struct item	*next;
 	unsigned int	len;
 	unsigned int	hash;
-	char		name[];
+	char		name[]; /* nul-terminated string (we allocate len+1) */
 };
 
 #define HASHSZ 256
-static struct item *config_hashtab[HASHSZ], *file_hashtab[HASHSZ];
+static struct item *config_hashtab[HASHSZ];
+static struct item *file_hashtab[HASHSZ];
 
+/* fnv-1a 32-bit */
 static unsigned int strhash(const char *str, unsigned int sz)
 {
-	/* fnv32 hash */
-	unsigned int i, hash = 2166136261U;
+	unsigned int i;
+	unsigned int hash = 2166136261U;
 
 	for (i = 0; i < sz; i++)
-		hash = (hash ^ str[i]) * 0x01000193;
+		hash = (hash ^ (unsigned char)str[i]) * 0x01000193U;
 	return hash;
 }
 
 /*
  * Add a new value to the configuration string.
+ * NOTE: `len` is number of meaningful bytes; we allocate len+1 and nul-terminate.
  */
 static void add_to_hashtable(const char *name, int len, unsigned int hash,
 			     struct item *hashtab[])
 {
 	struct item *aux;
+	size_t alloc = sizeof(*aux) + (size_t)len + 1;
 
-	aux = xmalloc(sizeof(*aux) + len);
+	aux = xmalloc(alloc);
 	memcpy(aux->name, name, len);
-	aux->len = len;
+	aux->name[len] = '\0';
+	aux->len = (unsigned int)len;
 	aux->hash = hash;
 	aux->next = hashtab[hash % HASHSZ];
 	hashtab[hash % HASHSZ] = aux;
@@ -150,11 +165,12 @@ static void add_to_hashtable(const char *name, int len, unsigned int hash,
 static bool in_hashtable(const char *name, int len, struct item *hashtab[])
 {
 	struct item *aux;
-	unsigned int hash = strhash(name, len);
+	unsigned int hash = strhash(name, (unsigned int)len);
+	unsigned int idx = hash % HASHSZ;
 
-	for (aux = hashtab[hash % HASHSZ]; aux; aux = aux->next) {
-		if (aux->hash == hash && aux->len == len &&
-		    memcmp(aux->name, name, len) == 0)
+	for (aux = hashtab[idx]; aux; aux = aux->next) {
+		if (aux->hash == hash && aux->len == (unsigned int)len &&
+		    memcmp(aux->name, name, (size_t)len) == 0)
 			return true;
 	}
 
@@ -178,12 +194,12 @@ static void use_config(const char *m, int slen)
 /* test if s ends in sub */
 static int str_ends_with(const char *s, int slen, const char *sub)
 {
-	int sublen = strlen(sub);
+	int sublen = (int)strlen(sub);
 
 	if (sublen > slen)
 		return 0;
 
-	return !memcmp(s + slen - sublen, sub, sublen);
+	return !memcmp(s + slen - sublen, sub, (size_t)sublen);
 }
 
 static void parse_config_file(const char *p)
@@ -192,24 +208,26 @@ static void parse_config_file(const char *p)
 	const char *start = p;
 
 	while ((p = strstr(p, "CONFIG_"))) {
-		if (p > start && (isalnum(p[-1]) || p[-1] == '_')) {
+		/* avoid matching inside identifiers like XCONFIG_FOO */
+		if (p > start && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) {
 			p += 7;
 			continue;
 		}
 		p += 7;
 		q = p;
-		while (isalnum(*q) || *q == '_')
+		while (isalnum((unsigned char)*q) || *q == '_')
 			q++;
-		if (str_ends_with(p, q - p, "_MODULE"))
+		if (str_ends_with(p, (int)(q - p), "_MODULE"))
 			r = q - 7;
 		else
 			r = q;
 		if (r > p)
-			use_config(p, r - p);
+			use_config(p, (int)(r - p));
 		p = q;
 	}
 }
 
+/* Read whole file safely into a malloc'ed null-terminated buffer. */
 static void *read_file(const char *filename)
 {
 	struct stat st;
@@ -218,21 +236,36 @@ static void *read_file(const char *filename)
 
 	fd = open(filename, O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "fixdep: error opening file: ");
-		perror(filename);
+		fprintf(stderr, "fixdep: error opening file '%s': %s\n", filename, strerror(errno));
 		exit(2);
 	}
 	if (fstat(fd, &st) < 0) {
-		fprintf(stderr, "fixdep: error fstat'ing file: ");
-		perror(filename);
+		fprintf(stderr, "fixdep: error fstat'ing file '%s': %s\n", filename, strerror(errno));
+		close(fd);
 		exit(2);
 	}
-	buf = xmalloc(st.st_size + 1);
-	if (read(fd, buf, st.st_size) != st.st_size) {
-		perror("fixdep: read");
-		exit(2);
+
+	/* allow zero-length files */
+	size_t size = (size_t)st.st_size;
+	buf = xmalloc(size + 1);
+
+	/* do a full read loop (handle short reads) */
+	size_t off = 0;
+	while (off < size) {
+		ssize_t r = read(fd, buf + off, size - off);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "fixdep: read error on '%s': %s\n", filename, strerror(errno));
+			close(fd);
+			free(buf);
+			exit(2);
+		}
+		if (r == 0)
+			break;
+		off += (size_t)r;
 	}
-	buf[st.st_size] = '\0';
+	buf[off] = '\0';
 	close(fd);
 
 	return buf;
@@ -253,10 +286,23 @@ static int is_no_parse_file(const char *s, int len)
 	       str_ends_with(s, len, ".so");
 }
 
+/* free contents of a hashtable */
+static void free_hashtable(struct item *hashtab[])
+{
+	for (size_t i = 0; i < HASHSZ; ++i) {
+		struct item *it = hashtab[i];
+		while (it) {
+			struct item *next = it->next;
+			free(it);
+			it = next;
+		}
+		hashtab[i] = NULL;
+	}
+}
+
 /*
  * Important: The below generated source_foo.o and deps_foo.o variable
- * assignments are parsed not only by make, but also by the rather simple
- * parser in scripts/mod/sumversion.c.
+ * assignments are parsed not only by make, but also by scripts/mod/sumversion.c.
  */
 static void parse_dep_file(char *p, const char *target)
 {
@@ -270,16 +316,10 @@ static void parse_dep_file(char *p, const char *target)
 		/* handle some special characters first. */
 		switch (*p) {
 		case '#':
-			/*
-			 * skip comments.
-			 * rustc may emit comments to dep-info.
-			 */
+			/* skip comments. rustc may emit comments to dep-info. */
 			p++;
 			while (*p != '\0' && *p != '\n') {
-				/*
-				 * escaped newlines continue the comment across
-				 * multiple lines.
-				 */
+				/* escaped newlines continue the comment across multiple lines. */
 				if (*p == '\\')
 					p++;
 				p++;
@@ -291,29 +331,19 @@ static void parse_dep_file(char *p, const char *target)
 			p++;
 			continue;
 		case '\\':
-			/*
-			 * backslash/newline combinations continue the
-			 * statement. Skip it just like a whitespace.
-			 */
+			/* backslash/newline combinations continue the statement. */
 			if (*(p + 1) == '\n') {
 				p += 2;
 				continue;
 			}
 			break;
 		case '\n':
-			/*
-			 * Makefiles use a line-based syntax, where the newline
-			 * is the end of a statement. After seeing a newline,
-			 * we expect the next token is a target.
-			 */
+			/* newline ends statement -> next token is a target */
 			p++;
 			is_target = true;
 			continue;
 		case ':':
-			/*
-			 * assume the first dependency after a colon as the
-			 * source file.
-			 */
+			/* colon: next token(s) are dependencies; the first one is the source */
 			p++;
 			is_target = false;
 			is_source = true;
@@ -324,19 +354,16 @@ static void parse_dep_file(char *p, const char *target)
 		q = p;
 		while (*q != ' ' && *q != '\t' && *q != '\n' && *q != '#' && *q != ':') {
 			if (*q == '\\') {
-				/*
-				 * backslash/newline combinations work like as
-				 * a whitespace, so this is the end of token.
-				 */
+				/* backslash/newline combos act like whitespace */
 				if (*(q + 1) == '\n')
 					break;
 
-				/* escaped special characters */
+				/* handle escaped special characters: make "\:" or "\#" part of the token */
 				if (*(q + 1) == '#' || *(q + 1) == ':') {
-					memmove(p + 1, p, q - p);
+					/* insert a copy of overlap to keep token contiguous */
+					memmove(p + 1, p, (size_t)(q - p));
 					p++;
 				}
-
 				q++;
 			}
 
@@ -345,7 +372,7 @@ static void parse_dep_file(char *p, const char *target)
 			q++;
 		}
 
-		/* Just discard the target */
+		/* Just discard the target token(s) */
 		if (is_target) {
 			p = q;
 			continue;
@@ -358,34 +385,21 @@ static void parse_dep_file(char *p, const char *target)
 		/*
 		 * Do not list the source file as dependency, so that kbuild is
 		 * not confused if a .c file is rewritten into .S or vice versa.
-		 * Storing it in source_* is needed for modpost to compute
-		 * srcversions.
 		 */
 		if (is_source) {
-			/*
-			 * The DT build rule concatenates multiple dep files.
-			 * When processing them, only process the first source
-			 * name, which will be the original one, and ignore any
-			 * other source names, which will be intermediate
-			 * temporary files.
-			 *
-			 * rustc emits the same dependency list for each
-			 * emission type. It is enough to list the source name
-			 * just once.
-			 */
 			if (!saw_any_target) {
 				saw_any_target = true;
 				printf("source_%s := %s\n\n", target, p);
 				printf("deps_%s := \\\n", target);
 				need_parse = true;
 			}
-		} else if (!is_ignored_file(p, q - p) &&
-			   !in_hashtable(p, q - p, file_hashtab)) {
+		} else if (!is_ignored_file(p, (int)(q - p)) &&
+			   !in_hashtable(p, (int)(q - p), file_hashtab)) {
 			printf("  %s \\\n", p);
 			need_parse = true;
 		}
 
-		if (need_parse && !is_no_parse_file(p, q - p)) {
+		if (need_parse && !is_no_parse_file(p, (int)(q - p))) {
 			void *buf;
 
 			buf = read_file(p);
@@ -422,15 +436,15 @@ int main(int argc, char *argv[])
 	printf("savedcmd_%s := %s\n\n", target, cmdline);
 
 	buf = read_file(depfile);
-	parse_dep_file(buf, target);
+	parse_dep_file((char *)buf, target);
 	free(buf);
+
+	/* free allocations */
+	free_hashtable(config_hashtab);
+	free_hashtable(file_hashtab);
 
 	fflush(stdout);
 
-	/*
-	 * In the intended usage, the stdout is redirected to .*.cmd files.
-	 * Call ferror() to catch errors such as "No space left on device".
-	 */
 	if (ferror(stdout)) {
 		fprintf(stderr, "fixdep: not all data was written to the output\n");
 		exit(1);
